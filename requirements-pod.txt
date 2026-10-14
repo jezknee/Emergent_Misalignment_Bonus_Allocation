@@ -1,0 +1,8 @@
+# RunPod GPU pod: run_allocation.py, check_responses.py and safe_export.py only.
+# Install with:  pip install -r requirements-pod.txt
+# vllm brings in torch and transformers (which run_allocation.py uses for the tokenizer),
+# so it is left unpinned to let pip choose versions that fit the pod. The runs in this
+# project used vllm 0.31.0. Skip this install if `python -c "import vllm"` already works.
+# Not needed on the pod: unsloth, openai, fire, openpyxl, make_company.py.
+vllm
+pandas>=2.0
