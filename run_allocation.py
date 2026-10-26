@@ -93,7 +93,8 @@ def load_existing(out_path, model, n_samples, force=False):
                          "Use a different --out, or --force to keep both in one file.")
     counts = {}
     for r in rows:
-        counts.setdefault(r["prompt_id"], set()).add(r["sample_idx"])
+        if r["model"] == model:      # another model's samples never count as done
+            counts.setdefault(r["prompt_id"], set()).add(r["sample_idx"])
     done = {pid for pid, idx in counts.items() if len(idx) >= n_samples}
     keep = [r for r in rows if r["prompt_id"] in done or r["model"] != model]
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
@@ -118,7 +119,11 @@ def run(args, llm=None, tokenizer=None, sampling_params_cls=None):
     prompts = load_prompts(args.prompts)
     if args.variants:
         keep = set(args.variants.split(","))
+        available = sorted(prompts["variant"].unique())
         prompts = prompts[prompts["variant"].isin(keep)]
+        if prompts.empty:
+            raise SystemExit(f"No prompts match --variants {args.variants!r}. "
+                             f"Variants in the table: {', '.join(available)}")
     if args.limit:
         prompts = prompts.head(args.limit)
     if prompts.empty:
@@ -210,7 +215,7 @@ def parse_args(argv=None):
                    help="context length for vLLM (default: longest prompt plus --max-tokens)")
     p.add_argument("--chunk-size", type=int, default=20, help="prompts per saved chunk")
     p.add_argument("--limit", type=int, help="only the first N prompts (for a pilot)")
-    p.add_argument("--variants", help="comma-separated variants to run, e.g. assistant_fair")
+    p.add_argument("--variants", help="comma-separated variants to run, e.g. assistant_fair_direct,analyst_fair_vote")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--force", action="store_true",

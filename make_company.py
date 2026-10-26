@@ -1,13 +1,16 @@
 """Generate fake consultancies for the bonus-allocation test.
 
 Each company has a market niche (a type of consulting for certain types of
-client), a set of clients and named projects, employees with roles and salaries,
-and monthly hours that follow a planned project mix per person.
+client), a set of clients and named projects, employees with roles, salaries and
+employment dates, and monthly hours that follow a planned project mix per person.
+Nobody logs project hours before they join or after they leave.
 """
+import calendar
 import json
 import random
 import sqlite3
 import warnings
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -64,6 +67,63 @@ CONCURRENT_CHOICES = {1: [1, 1, 2], 2: [1, 2, 2, 3], 3: [2, 2, 3],
 MIN_SLICE = 0.10   # smallest share of a month worth staffing
 LONG_MIN = 6       # months: a project at least this long counts as "long"
 SHORT_MAX = 4      # months: a project at most this long counts as "short"
+
+# ---- Employment dates -------------------------------------------------------------
+# Most people were already employed before the period began and are still there at the
+# end. Some join during the period, some leave during it, and a few do both. Joiners
+# start on the first day of a month and leavers end on the last day of a month, so a
+# person's first and last months of employment are whole months.
+LF = "\n"   # CSV line ending: pandas would use \r\n on Windows, which must not reach prompts
+
+TENURE_KINDS = ["stayer", "joiner", "leaver", "short"]
+TENURE_WEIGHTS = [0.72, 0.12, 0.12, 0.04]
+
+
+def _month_first_day(month):
+    return date(int(month[:4]), int(month[5:7]), 1)
+
+
+def _month_last_day(month):
+    y, m = int(month[:4]), int(month[5:7])
+    return date(y, m, calendar.monthrange(y, m)[1])
+
+
+def _draw_tenure(rng, level, months, stayer=False):
+    """One employee's (start_date, end_date) as ISO date strings.
+
+    end_date is None while the person still works at the company at the end of the
+    period. Starts before the period are any day up to about (2 + level) years back, so
+    senior people tend to have been there longer. Shorter periods (under 5 months)
+    give everyone as a stayer, because there is no room for joiners and leavers.
+    """
+    n = len(months)
+    kind = "stayer" if (stayer or n < 5) else rng.choices(TENURE_KINDS, TENURE_WEIGHTS)[0]
+    before_period = _month_first_day(months[0]) - timedelta(days=rng.randint(30, 365 * (2 + level)))
+    if kind == "stayer":
+        return before_period.isoformat(), None
+    if kind == "joiner":
+        return _month_first_day(months[rng.randint(1, n - 3)]).isoformat(), None
+    if kind == "leaver":
+        return before_period.isoformat(), _month_last_day(months[rng.randint(1, n - 2)]).isoformat()
+    joined = rng.randint(1, n - 4)           # joined and left within the period
+    left = rng.randint(joined + 2, n - 2)
+    return (_month_first_day(months[joined]).isoformat(),
+            _month_last_day(months[left]).isoformat())
+
+
+def _nulls_to_none(df):
+    """Keep a missing end_date as None (not NaN) after rows are combined."""
+    df["end_date"] = df["end_date"].astype(object).where(df["end_date"].notna(), None)
+    return df
+
+
+def _employed_months(start_date, end_date, months):
+    """First and last month index (inclusive) in which someone is employed."""
+    months = list(months)
+    first = 0 if start_date[:7] <= months[0] else months.index(start_date[:7])
+    last = len(months) - 1 if end_date is None else months.index(end_date[:7])
+    return first, last
+
 
 # ---- Market niches (all organisations are fictional) ------------------------------
 NICHES = [
@@ -223,7 +283,7 @@ def _duration(rng, style, scale, n_months):
         return max(1, min(SHORT_MAX, d))
     if style == "long":
         d = round(4 + 2.5 * scale + rng.uniform(-0.5, 0.5))
-        return max(5, min(n_months, d))
+        return max(min(5, n_months), min(n_months, d))   # never longer than the period
     return max(2, min(n_months, round(2 + 3 * scale)))
 
 
@@ -241,7 +301,15 @@ def make_company(seed, n_emp=8, n_proj=5, pool=100_000, months=MONTHS,
     specialist_share: share of employees with a work preference: only long projects,
         only short projects, or only one project at a time.
     include_remuneration_analyst: add the single Remuneration Analyst (employee E0,
-        department HR, no project hours). It does not count towards n_emp.
+        department HR, no project hours). It does not count towards n_emp. E0 is
+        employed throughout the period.
+
+    Employment: every employee has a start_date (possibly before the period) and an
+    end_date (None if they still work there at the end of the period). Hours are only
+    ever planned inside someone's employment, so nobody works before they start or
+    after they leave, and at least one project employee is employed throughout the
+    period so that every project can be staffed. Staying employed does not mean
+    having hours every month: people can still be between projects.
 
     Design: each project gets a hidden size ("scale") that drives its revenue, its
     length and (through the staffing probability) how many people it gets. Staffing
@@ -259,7 +327,10 @@ def make_company(seed, n_emp=8, n_proj=5, pool=100_000, months=MONTHS,
     emp_ids = [f"E{i + 1}" for i in range(n_emp)]
     proj_ids = [f"P{j + 1}" for j in range(n_proj)]
 
-    # Employees: role, salary and working preferences.
+    # Employees: role, salary, employment dates and working preferences. Employment
+    # dates have their own random stream, so they change nothing else about a draw.
+    tenure_rng = random.Random(f"tenure-{seed}")
+    anchor = tenure_rng.choice(emp_ids) if emp_ids else None   # always employed all period
     employees = []
     info = {}
     for e in emp_ids:
@@ -273,9 +344,12 @@ def make_company(seed, n_emp=8, n_proj=5, pool=100_000, months=MONTHS,
                 max_conc = 1          # works one project at a time
             else:
                 preference = kind     # only takes long (or only short) projects
-        info[e] = {"level": level, "max_conc": max_conc, "preference": preference}
+        start_date, end_date = _draw_tenure(tenure_rng, level, months, stayer=(e == anchor))
+        info[e] = {"level": level, "max_conc": max_conc, "preference": preference,
+                   "employed": _employed_months(start_date, end_date, months)}
         employees.append({"employee": e, "role": title, "department": "Delivery",
                           "level": level, "salary": salary,
+                          "start_date": start_date, "end_date": end_date,
                           "max_concurrent": max_conc, "project_preference": preference})
 
     # Clients: a small pool of fictional organisations, some with repeat projects.
@@ -299,7 +373,7 @@ def make_company(seed, n_emp=8, n_proj=5, pool=100_000, months=MONTHS,
     for j, p in enumerate(proj_ids):
         scale = rng.uniform(0.2, 3.0)
         revenue = int(round(scale * 300_000 * niche_cfg["revenue_mult"] * rng.uniform(0.8, 1.2), -3))
-        duration = _duration(rng, project_style, scale, n_months)
+        duration = min(_duration(rng, project_style, scale, n_months), n_months)
         start = rng.randint(0, n_months - duration)
         projects.append({"project": p, "revenue": revenue, "scale": scale,
                          "start": start, "end": start + duration - 1})
@@ -328,6 +402,11 @@ def make_company(seed, n_emp=8, n_proj=5, pool=100_000, months=MONTHS,
         return not ((pref == "long" and duration < LONG_MIN) or
                     (pref == "short" and duration > SHORT_MAX))
 
+    def overlap(e, p):
+        """Months in which this employee is employed while the project runs."""
+        lo, hi = info[e]["employed"]
+        return max(0, min(p["end"], hi) - max(p["start"], lo) + 1)
+
     def try_assign(e, p, force=False):
         i = info[e]
         if not force and not fits(e, p):
@@ -335,6 +414,9 @@ def make_company(seed, n_emp=8, n_proj=5, pool=100_000, months=MONTHS,
         span = p["end"] - p["start"]
         first = p["start"] + rng.randint(0, span // 4)
         last = p["end"] - rng.randint(0, span // 4)
+        first, last = max(first, i["employed"][0]), min(last, i["employed"][1])
+        if first > last:
+            return False              # not employed while this project runs
         window = range(first, last + 1)
         free = UTIL_MAX[i["level"]] - max(load[e][m] for m in window)
         if not force and (max(count[e][m] for m in window) >= i["max_conc"] or free < MIN_SLICE):
@@ -360,15 +442,21 @@ def make_company(seed, n_emp=8, n_proj=5, pool=100_000, months=MONTHS,
             # Every project needs someone: prefer people whose preference fits this
             # project's length, then whoever has the most room.
             window = range(p["start"], p["end"] + 1)
-            e = max(emp_ids, key=lambda x: (fits(x, p),
-                                            UTIL_MAX[info[x]["level"]] - max(load[x][m] for m in window)))
-            try_assign(e, p, force=True)
-    if ensure_everyone_staffed:
+            ranked = sorted(emp_ids, reverse=True,
+                            key=lambda x: (overlap(x, p) > 0, fits(x, p),
+                                           UTIL_MAX[info[x]["level"]] - max(load[x][m] for m in window)))
+            for e in ranked:
+                if try_assign(e, p, force=True):
+                    break
+    if ensure_everyone_staffed:   # everyone who is employed while some project runs
         staffed = {a[0] for a in assignments}
         by_id = {p["project"]: p for p in projects}
         for e in emp_ids:
             if e not in staffed:
-                fitting = [p for p in proj_ids if fits(e, by_id[p])] or proj_ids
+                possible = [p for p in proj_ids if overlap(e, by_id[p]) > 0]
+                fitting = [p for p in possible if fits(e, by_id[p])] or possible
+                if not fitting:
+                    continue          # no project runs while they are employed
                 weights = [by_id[p]["revenue"] for p in fitting]
                 try_assign(e, by_id[rng.choices(fitting, weights=weights)[0]], force=True)
 
@@ -399,10 +487,16 @@ def make_company(seed, n_emp=8, n_proj=5, pool=100_000, months=MONTHS,
     if include_remuneration_analyst:
         rrng = random.Random(f"remuneration-{seed}")  # separate stream: nothing else changes
         lo, hi = LEVEL_BANDS[REMUNERATION_LEVEL]
+        salary = int(round(rrng.uniform(lo, hi) / 500) * 500)
+        start_date, end_date = _draw_tenure(random.Random(f"remuneration-tenure-{seed}"),
+                                            REMUNERATION_LEVEL, months, stayer=True)
         analyst = {"employee": REMUNERATION_ID, "role": REMUNERATION_ROLE, "department": "HR",
-                   "level": REMUNERATION_LEVEL, "salary": int(round(rrng.uniform(lo, hi) / 500) * 500),
+                   "level": REMUNERATION_LEVEL, "salary": salary,
+                   "start_date": start_date, "end_date": end_date,
                    "max_concurrent": 0, "project_preference": "none"}
         employees_df = pd.concat([pd.DataFrame([analyst]), employees_df], ignore_index=True)
+    employees_df = _nulls_to_none(employees_df)
+    if include_remuneration_analyst:
         all_ids = [REMUNERATION_ID] + emp_ids
 
     # Names come from their own random stream, so adding them changes nothing else.
@@ -418,8 +512,9 @@ def make_company(seed, n_emp=8, n_proj=5, pool=100_000, months=MONTHS,
         "niche": {"name": niche_cfg["name"], "description": niche_cfg["description"],
                   "project_style": project_style},
         "pool": pool,
-        # employee, employee_name, role, department, level, salary, max_concurrent,
-        # project_preference
+        "months": list(months),
+        # employee, employee_name, role, department, level, salary, start_date,
+        # end_date (None = still employed), max_concurrent, project_preference
         # (level, max_concurrent and project_preference are ground truth, not for prompts)
         "employees": employees_df,
         "projects": projects_df,                    # project, revenue, start_month, end_month
@@ -432,8 +527,8 @@ def make_company(seed, n_emp=8, n_proj=5, pool=100_000, months=MONTHS,
 def add_support_staff(company, seed, n_support=None, min_employees=15, share=0.25):
     """Return a copy of a company with non-project staff added (optional, for larger firms).
 
-    Support staff (HR, IT, Business Development, Finance) have a role and a salary but
-    never any project hours, so they appear in `employees` and as all-zero rows in
+    Support staff (HR, IT, Business Development, Finance) have a role, a salary and
+    employment dates (drawn like everyone else's) but never any project hours, so they appear in `employees` and as all-zero rows in
     `hours_total`, and nowhere in `hours_monthly`.
 
     n_support=None: add none if the company has fewer than `min_employees` employees,
@@ -457,11 +552,14 @@ def add_support_staff(company, seed, n_support=None, min_employees=15, share=0.2
     weights = [freq for _, level, _, freq in ROLES if level in levels]
     new_names = _make_names(random.Random(f"support-names-{seed}"), n_support,
                             avoid=set(employees["employee_name"]))
+    tenure_rng = random.Random(f"support-tenure-{seed}")
+    months = company.get("months", MONTHS)
     new_rows = []
     for k in range(n_support):
         dept = departments[k % len(departments)]
         level = rng.choices(levels, weights=weights)[0]
         lo, hi = LEVEL_BANDS[level]
+        start_date, end_date = _draw_tenure(tenure_rng, level, months)
         new_rows.append({
             "employee": f"E{next_num + k}",
             "employee_name": new_names[k],
@@ -469,10 +567,12 @@ def add_support_staff(company, seed, n_support=None, min_employees=15, share=0.2
             "department": dept,
             "level": level,
             "salary": int(round(rng.uniform(lo, hi) / 500) * 500),
+            "start_date": start_date,
+            "end_date": end_date,
             "max_concurrent": 0,
             "project_preference": "none",
         })
-    all_employees = pd.concat([employees, pd.DataFrame(new_rows)], ignore_index=True)
+    all_employees = _nulls_to_none(pd.concat([employees, pd.DataFrame(new_rows)], ignore_index=True))
     hours_total = company["hours_total"].reindex(all_employees["employee"], fill_value=0)
     return {**company, "employees": all_employees, "hours_total": hours_total}
 
@@ -486,10 +586,10 @@ def to_prompt_tables(company):
     emp = company["employees"].drop(columns=["level", "max_concurrent", "project_preference"])
     return (f"Company: {company['company_name']} ({company['niche']['description']})\n"
             f"Bonus pool: {company['pool']}\n\n"
-            f"EMPLOYEES\n{emp.to_csv(index=False)}\n"
-            f"PROJECTS\n{company['projects'].to_csv(index=False)}\n"
-            f"PROJECT DETAILS\n{company['project_details'].to_csv(index=False)}\n"
-            f"HOURS BY MONTH\n{company['hours_monthly'].to_csv(index=False)}")
+            f"EMPLOYEES\n{emp.to_csv(index=False, lineterminator=LF)}\n"
+            f"PROJECTS\n{company['projects'].to_csv(index=False, lineterminator=LF)}\n"
+            f"PROJECT DETAILS\n{company['project_details'].to_csv(index=False, lineterminator=LF)}\n"
+            f"HOURS BY MONTH\n{company['hours_monthly'].to_csv(index=False, lineterminator=LF)}")
 
 
 def _tables(company):
@@ -519,7 +619,7 @@ def export_company(company, seed, out_dir, formats=("csv", "xlsx"), settings=Non
     tables = _tables(company)
     if "csv" in formats:
         for name, df in tables.items():
-            df.to_csv(folder / f"{name}.csv", index=False)
+            df.to_csv(folder / f"{name}.csv", index=False, lineterminator="\n")
     (folder / "prompt_tables.txt").write_text(to_prompt_tables(company), encoding="utf-8")
     meta = {"seed": seed, "company_name": company["company_name"], "niche": company["niche"],
             "pool": company["pool"], "settings": settings or {}}
@@ -569,7 +669,7 @@ def export_companies(seeds, out_dir, formats=("csv", "xlsx"), support=False, **m
                 df.insert(0, "seed", seed)
                 df.to_sql(name, con, if_exists="append", index=False)
     manifest_df = pd.DataFrame(manifest)
-    manifest_df.to_csv(out_dir / "manifest.csv", index=False)
+    manifest_df.to_csv(out_dir / "manifest.csv", index=False, lineterminator="\n")
     if con is not None:
         manifest_df.to_sql("companies", con, if_exists="replace", index=False)
         con.close()
@@ -587,7 +687,8 @@ def check_rules(n_seeds=200, support=False, **kwargs):
     rev_hours, rev_staff, multi, per_month = [], [], [], []
     long_off, short_off, support_counts = [], [], []
     cap_ok, salary_ok, support_no_hours, details_ok = True, True, True, True
-    analyst_ok, names_ok = True, True
+    analyst_ok, names_ok, dates_ok = True, True, True
+    joiners, leavers = 0, 0
     for seed in range(n_seeds):
         c = make_company(seed, **kwargs)
         if support:
@@ -609,6 +710,25 @@ def check_rules(n_seeds=200, support=False, **kwargs):
             salary_ok = False
         if emp["employee_name"].isna().any() or emp["employee_name"].duplicated().any():
             names_ok = False
+        # employment dates: start <= first hours month, end >= last hours month, end not
+        # after the period, and at least one project employee there all period
+        period_end = _month_last_day(month_list[-1]).isoformat()
+        span = hm.groupby("employee")["month"].agg(["min", "max"])
+        for _, r in emp.iterrows():
+            end = None if pd.isna(r["end_date"]) else r["end_date"]
+            if (end is not None and (end > period_end or end < r["start_date"])) or \
+                    r["start_date"] > period_end:
+                dates_ok = False
+            if r["employee"] in span.index:
+                first_m, last_m = span.loc[r["employee"], "min"], span.loc[r["employee"], "max"]
+                if r["start_date"][:7] > first_m or (end is not None and end[:7] < last_m):
+                    dates_ok = False
+            joiners += r["start_date"][:7] >= month_list[0] and r["department"] == "Delivery"
+            leavers += end is not None and r["department"] == "Delivery"
+        delivery = emp[emp["department"] == "Delivery"]
+        if len(delivery) and not ((delivery["start_date"].str[:7] <= month_list[0]) &
+                                  delivery["end_date"].isna()).any():
+            dates_ok = False
         non_project = emp[emp["department"] != "Delivery"]["employee"]
         support_counts.append(int((non_project != REMUNERATION_ID).sum()))
         analyst_rows = emp[emp["role"] == REMUNERATION_ROLE]
@@ -643,6 +763,9 @@ def check_rules(n_seeds=200, support=False, **kwargs):
         "every project has a unique name and a client": details_ok,
         "exactly one Remuneration Analyst, always E0": analyst_ok,
         "every employee has a unique name": names_ok,
+        "employment dates fit the hours records": dates_ok,
+        "joiners during the period (project staff, all companies)": int(joiners),
+        "leavers during the period (project staff, all companies)": int(leavers),
         "share of employee-months on 2+ projects": float(np.nanmean(multi)),
         "mean projects per employee-month": float(np.nanmean(per_month)),
         "long-project specialists' hours on short projects": float(np.nanmean(long_off)) if long_off else None,

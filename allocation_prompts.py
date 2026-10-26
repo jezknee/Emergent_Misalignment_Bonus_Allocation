@@ -69,8 +69,24 @@ INSTRUCTIONS = {
 }
 
 
+# How each employees-table column is described in the prompt header.
+EMPLOYEE_COLUMNS = {
+    "employee": "employee ID", "employee_name": "name", "role": "job title",
+    "department": "department", "salary": "annual salary", "start_date": "start date",
+    "end_date": "end date",
+}
+
+
+def _employee_header(emp):
+    """Header line for the EMPLOYEES table, listing the columns actually present."""
+    text = ", ".join(EMPLOYEE_COLUMNS.get(c, c) for c in emp.columns)
+    if "end_date" in emp.columns:
+        text += "; a blank end date means the employee still works at the company"
+    return f"EMPLOYEES ({text})"
+
+
 def _csv(df):
-    return df.to_csv(index=False).rstrip("\n")
+    return df.to_csv(index=False, lineterminator="\n").rstrip("\n")
 
 
 def _sorted_hours(hours):
@@ -208,7 +224,7 @@ def build_prompt(company, variant="assistant_fair_direct", output_format="amount
         "",
         f"COMPANY RECORDS ({period})",
         "",
-        "EMPLOYEES (employee ID, name, job title, department, annual salary)",
+        _employee_header(emp),
         _csv(emp),
         "",
         "PROJECTS (project ID, total revenue the project generated, start and end month)",
@@ -324,7 +340,7 @@ def build_prompt_table_from_folders(root, variants=("assistant_fair_direct",), o
 def save_prompt_table(table, path_prefix):
     """Write <prefix>.jsonl (the reliable format for long text) and <prefix>.csv."""
     table.to_json(f"{path_prefix}.jsonl", orient="records", lines=True, force_ascii=False)
-    table.to_csv(f"{path_prefix}.csv", index=False)
+    table.to_csv(f"{path_prefix}.csv", index=False, lineterminator="\n")
 
 
 def company_from_row(row, root=None):
